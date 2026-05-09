@@ -71,7 +71,6 @@ export async function askClaude(message: string, sessionID?: string, cwd?: strin
 function spawnClaude(args: string[], cwd?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn(claudeBin, args, {
-      timeout: 5 * 60_000,
       env: { ...process.env },
       shell: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -88,7 +87,14 @@ function spawnClaude(args: string[], cwd?: string): Promise<string> {
       reject(new Error(`claude failed: ${err.message}\n${stderr.slice(0, 300)}`));
     });
 
+    // 5 minute timeout
+    const timer = setTimeout(() => {
+      proc.kill("SIGTERM");
+      reject(new Error("claude timeout (5 min)"));
+    }, 5 * 60_000);
+
     proc.on("close", (code) => {
+      clearTimeout(timer);
       if (code !== 0 && !stdout) {
         reject(new Error(`claude exited with code ${code}\n${stderr.slice(0, 300)}`));
         return;

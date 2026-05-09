@@ -1,26 +1,8 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { logger } from "../util/logger.js";
-
-const claudeBin = resolveClaudeBin();
-
-function resolveClaudeBin(): string {
-  const bin = process.env.CLAUDE_BIN || "claude";
-  if (process.platform !== "win32" || path.isAbsolute(bin)) return bin;
-  try {
-    const resolved = execFileSync("where", [bin], { encoding: "utf-8", timeout: 5000 }).trim().split(/\r?\n/)[0];
-    if (resolved) {
-      if (!path.extname(resolved)) {
-        const cmdPath = resolved + ".cmd";
-        if (fs.existsSync(cmdPath)) return cmdPath;
-      }
-      if (fs.existsSync(resolved)) return resolved;
-    }
-  } catch {}
-  return bin;
-}
 
 interface ClaudeOutput {
   result: string;
@@ -33,6 +15,13 @@ export interface TerminalSession {
   cwd: string;
   pid: number;
 }
+
+/** Resolve claude CLI for direct node invocation on Windows (avoids .cmd quoting issues) */
+const claudeCliJs = (() => {
+  if (process.platform !== "win32") return null;
+  const cliJs = path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+  return fs.existsSync(cliJs) ? cliJs : null;
+})();
 
 export function findTerminalSession(): TerminalSession | null {
   const sessionsDir = path.join(os.homedir(), ".claude", "sessions");
@@ -62,6 +51,7 @@ export function findTerminalSession(): TerminalSession | null {
 }
 
 export async function askClaude(message: string, sessionID?: string, cwd?: string): Promise<{ text: string; sessionID: string }> {
+  // Pass message via stdin to avoid Windows shell encoding issues with Chinese characters
   const args = ["--dangerously-skip-permissions", "--output-format", "json", "-p"];
   if (sessionID) args.unshift("--resume", sessionID);
 
@@ -83,16 +73,26 @@ export async function askClaude(message: string, sessionID?: string, cwd?: strin
 
 function spawnClaude(args: string[], cwd?: string, message?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const isWin = process.platform === "win32";
-    const spawnBin = isWin ? (process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe") : claudeBin;
-    const cmdStr = `${claudeBin} ${args.map(a => `"${a}"`).join(" ")}`;
-    const spawnArgs = isWin ? ["/d", "/s", "/c", cmdStr] : args;
+    let spawnBin: string;
+    let spawnArgs: string[];
+
+    if (claudeCliJs) {
+      // Windows: use node directly with cli.js to avoid .cmd quoting issues
+      spawnBin = process.execPath;
+      spawnArgs = [claudeCliJs, ...args];
+    } else {
+      spawnBin = "claude";
+      spawnArgs = args;
+    }
+
     const proc = spawn(spawnBin, spawnArgs, {
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
       ...(cwd ? { cwd } : {}),
+      ...(claudeCliJs ? {} : { shell: true }),
     });
 
+    // Write message to stdin then close
     if (message) {
       proc.stdin.write(message);
     }

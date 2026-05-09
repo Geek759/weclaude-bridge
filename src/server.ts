@@ -1,127 +1,157 @@
-import { loadAuth, login } from "./wechat/auth.js";
-import { Poller } from "./wechat/poller.js";
-import { Sender } from "./wechat/sender.js";
-import { askClaude } from "./claude/client.js";
-import { SessionStore } from "./claude/sessions.js";
-import { log } from "./util/logger.js";
 import fs from "node:fs";
-import path from "node:path";
+import { logger } from "./util/logger.js";
+import { loadAuth, login, type Auth } from "./wechat/auth.js";
+import { Poller, type InboundMessage } from "./wechat/poller.js";
+import { sendText } from "./wechat/sender.js";
+import { sendWeixinMediaFile } from "./media/send-media.js";
+import { askClaude, findTerminalSessionId } from "./claude/client.js";
+import { SessionStore } from "./claude/sessions.js";
 
-const RESET_COMMANDS = new Set(["/reset", "/new", "/clear", "/restart"]);
+const MAX_MSG_LEN = 4000;
+const RESET_COMMANDS = new Set(["/reset", "reset", "/new", "新对话", "新会话"]);
+
+function splitText(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = start + maxLen;
+    if (end >= text.length) { chunks.push(text.slice(start)); break; }
+    const nl = text.lastIndexOf("\n", end);
+    if (nl > start) end = nl + 1;
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks;
+}
 
 export class Server {
-  private sender!: Sender;
-  private sessions: SessionStore;
-  private processedMsgIds = new Set<string>();
+  private auth: Auth;
+  private sessions = new SessionStore();
+  private processing = new Set<string>();
+  private poller: Poller;
+  private sharedSessionId: string | null = null;
 
-  constructor() {
-    this.sessions = new SessionStore();
+  constructor(auth: Auth, sharedSessionId?: string) {
+    this.auth = auth;
+    this.sharedSessionId = sharedSessionId || null;
+    this.poller = new Poller({
+      baseUrl: auth.base_url, token: auth.bot_token,
+      cdnBaseUrl: auth.base_url.replace("ilinkai", "cdn"),
+    });
   }
 
-  async handleMessage(msg: {
-    msgId: string;
-    fromUser: string;
-    content: string;
-    msgType: number;
-  }): Promise<void> {
-    // Dedup
-    if (this.processedMsgIds.has(msg.msgId)) return;
-    this.processedMsgIds.add(msg.msgId);
-
-    // Keep set from growing unbounded
-    if (this.processedMsgIds.size > 10000) {
-      const arr = [...this.processedMsgIds];
-      this.processedMsgIds = new Set(arr.slice(-5000));
+  async start(): Promise<void> {
+    logger.info(`已登录: ${this.auth.user_id || this.auth.bot_id}`);
+    if (this.sharedSessionId) {
+      logger.info(`复用终端会话: ${this.sharedSessionId}`);
+    } else {
+      logger.info("未找到终端会话，将为每个用户创建独立会话");
     }
+    const controller = new AbortController();
+    process.on("SIGINT", () => { logger.info("收到退出信号..."); controller.abort(); });
+    process.on("SIGTERM", () => { logger.info("收到终止信号..."); controller.abort(); });
 
-    const userID = msg.fromUser;
-    const text = msg.content.trim();
+    await this.poller.start(controller.signal, (msg) => this.handleMessage(msg));
+  }
 
-    // Reset command
-    if (RESET_COMMANDS.has(text)) {
-      this.sessions.delete(userID);
-      await this.sender.sendText(userID, "Session reset.");
+  private async handleMessage(msg: InboundMessage): Promise<void> {
+    const { userID, text, contextToken } = msg;
+    logger.info(`[${new Date().toLocaleTimeString()}] ${userID}: ${text.slice(0, 80)}`);
+
+    if (this.processing.has(userID)) {
+      await sendText(userID, "上一条消息还在处理中，请稍候...", { baseUrl: this.auth.base_url, token: this.auth.bot_token, contextToken }).catch(() => {});
       return;
     }
+    this.processing.add(userID);
 
-    // Ask Claude
-    const sessionID = this.sessions.get(userID);
     try {
-      const result = await askClaude(text, sessionID);
-
-      if (result.session_id) {
-        this.sessions.set(userID, result.session_id);
+      // Reset
+      if (RESET_COMMANDS.has(text.trim().toLowerCase())) {
+        this.sessions.delete(userID);
+        await sendText(userID, "对话已重置，开始新的会话。", { baseUrl: this.auth.base_url, token: this.auth.bot_token, contextToken });
+        return;
       }
 
-      // Send reply
-      if (result.result) {
-        await this.sender.sendText(userID, result.result);
-
-        // Check if Claude output references local files
-        await this.sendFileReferences(userID, result.result);
+      // Build prompt
+      let prompt = text;
+      if (msg.mediaPath) {
+        prompt = prompt
+          ? `${prompt}\n\n[用户发送了文件: ${msg.mediaPath}]`
+          : `[用户发送了文件: ${msg.mediaPath}]`;
       }
-    } catch (e: unknown) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      log("Claude error:", errMsg);
-      await this.sender.sendText(userID, `Error: ${errMsg}`);
-    }
-  }
 
-  private async sendFileReferences(userID: string, text: string): Promise<void> {
-    // Match file paths in Claude output
-    const pathRegex =
-      /(?:^|[\s"'`])([A-Za-z]:\\[\S]+|\/[\S]+\.[a-zA-Z0-9]{1,5})(?:[\s"'`]|$)/gm;
-    const matches = text.matchAll(pathRegex);
+      // Ask Claude - use shared terminal session or per-user session
+      const sessionID = this.sharedSessionId || this.sessions.get(userID);
+      logger.debug(`claude session: ${sessionID || "new"}`);
 
-    for (const match of matches) {
-      const filePath = match[1].replace(/["'`,.:;]+$/, "");
+      let result: { text: string; sessionID: string };
       try {
-        if (fs.existsSync(filePath)) {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile()) {
-            log("Sending file reference:", filePath);
-            if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(filePath)) {
-              await this.sender.sendImage(userID, filePath);
-            } else {
-              await this.sender.sendFile(userID, filePath);
+        result = await askClaude(prompt, sessionID);
+      } catch (err) {
+        const errMsg = String(err);
+        if (sessionID && errMsg.includes("No conversation found")) {
+          logger.info(`session ${sessionID} 已失效，创建新会话`);
+          result = await askClaude(prompt);
+        } else {
+          throw err;
+        }
+      }
+
+      if (result.sessionID) this.sessions.set(userID, result.sessionID);
+
+      const reply = result.text;
+      if (!reply) {
+        await sendText(userID, "(Claude 未返回回复)", { baseUrl: this.auth.base_url, token: this.auth.bot_token, contextToken });
+        return;
+      }
+
+      // Check for file references in reply
+      const fileMatches = reply.match(/(?:\/[\w./-]+\.\w+|[A-Z]:\\[\\w\\. -]+)/g);
+      const sendOpts = { baseUrl: this.auth.base_url, token: this.auth.bot_token, contextToken };
+
+      if (fileMatches) {
+        for (const filePath of fileMatches) {
+          if (fs.existsSync(filePath)) {
+            try {
+              await sendWeixinMediaFile({
+                filePath, to: userID, text: "", opts: sendOpts,
+                cdnBaseUrl: this.auth.base_url.replace("ilinkai", "cdn"),
+              });
+            } catch (err) {
+              logger.error(`发送文件失败 ${filePath}: ${err}`);
             }
           }
         }
-      } catch {
-        // Ignore file send errors
       }
+
+      // Send text reply
+      for (const chunk of splitText(reply, MAX_MSG_LEN)) {
+        await sendText(userID, chunk, sendOpts);
+      }
+
+      logger.info(`[${new Date().toLocaleTimeString()}] -> ${userID} (${reply.length} chars)`);
+    } catch (err) {
+      logger.error(`处理消息失败: ${err}`);
+      await sendText(userID, `抱歉，处理出错了: ${String(err).slice(0, 200)}`, {
+        baseUrl: this.auth.base_url, token: this.auth.bot_token, contextToken,
+      }).catch(() => {});
+    } finally {
+      this.processing.delete(userID);
     }
   }
 }
 
 export async function runServer(): Promise<void> {
-  console.log("\n=== weclaude-bridge ===");
-
-  let auth = await loadAuth();
+  let auth = loadAuth();
   if (!auth) {
-    console.log("Not logged in. Starting login flow...");
+    logger.info("未登录，开始扫码登录...");
     auth = await login();
   }
 
-  console.log(`\nLogged in as: ${auth.operatorUsername}`);
-  console.log("Starting message poller...\n");
+  // Try to find and reuse the current terminal's Claude session
+  const terminalSessionId = process.env.CLAUDE_SESSION_ID || findTerminalSessionId();
 
-  const poller = new Poller(auth);
-  const server = new Server();
-  server["sender"] = new Sender(auth);
-
-  const ac = new AbortController();
-
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
-    ac.abort();
-  });
-
-  process.on("SIGTERM", () => {
-    ac.abort();
-  });
-
-  await poller.start(ac.signal, (msg) => {
-    server.handleMessage(msg).catch((e) => log("handleMessage error:", e));
-  });
+  const server = new Server(auth, terminalSessionId || undefined);
+  await server.start();
 }

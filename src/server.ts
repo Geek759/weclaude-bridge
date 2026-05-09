@@ -4,7 +4,7 @@ import { loadAuth, login, type Auth } from "./wechat/auth.js";
 import { Poller, type InboundMessage } from "./wechat/poller.js";
 import { sendText } from "./wechat/sender.js";
 import { sendWeixinMediaFile } from "./media/send-media.js";
-import { askClaude, findTerminalSessionId } from "./claude/client.js";
+import { askClaude, findTerminalSession, type TerminalSession } from "./claude/client.js";
 import { SessionStore } from "./claude/sessions.js";
 
 const MAX_MSG_LEN = 4000;
@@ -30,11 +30,11 @@ export class Server {
   private sessions = new SessionStore();
   private processing = new Set<string>();
   private poller: Poller;
-  private sharedSessionId: string | null = null;
+  private terminalSession: TerminalSession | null = null;
 
-  constructor(auth: Auth, sharedSessionId?: string) {
+  constructor(auth: Auth, terminalSession?: TerminalSession) {
     this.auth = auth;
-    this.sharedSessionId = sharedSessionId || null;
+    this.terminalSession = terminalSession || null;
     this.poller = new Poller({
       baseUrl: auth.base_url, token: auth.bot_token,
       cdnBaseUrl: auth.base_url.replace("ilinkai", "cdn"),
@@ -43,8 +43,8 @@ export class Server {
 
   async start(): Promise<void> {
     logger.info(`已登录: ${this.auth.user_id || this.auth.bot_id}`);
-    if (this.sharedSessionId) {
-      logger.info(`复用终端会话: ${this.sharedSessionId}`);
+    if (this.terminalSession) {
+      logger.info(`复用终端会话: ${this.terminalSession.sessionId} (cwd=${this.terminalSession.cwd})`);
     } else {
       logger.info("未找到终端会话，将为每个用户创建独立会话");
     }
@@ -82,17 +82,18 @@ export class Server {
       }
 
       // Ask Claude - use shared terminal session or per-user session
-      const sessionID = this.sharedSessionId || this.sessions.get(userID);
-      logger.debug(`claude session: ${sessionID || "new"}`);
+      const sessionID = this.terminalSession?.sessionId || this.sessions.get(userID);
+      const cwd = this.terminalSession?.cwd;
+      logger.debug(`claude session: ${sessionID || "new"}, cwd: ${cwd || "default"}`);
 
       let result: { text: string; sessionID: string };
       try {
-        result = await askClaude(prompt, sessionID);
+        result = await askClaude(prompt, sessionID, cwd);
       } catch (err) {
         const errMsg = String(err);
         if (sessionID && errMsg.includes("No conversation found")) {
           logger.info(`session ${sessionID} 已失效，创建新会话`);
-          result = await askClaude(prompt);
+          result = await askClaude(prompt, undefined, cwd);
         } else {
           throw err;
         }
@@ -150,8 +151,8 @@ export async function runServer(): Promise<void> {
   }
 
   // Try to find and reuse the current terminal's Claude session
-  const terminalSessionId = process.env.CLAUDE_SESSION_ID || findTerminalSessionId();
+  const terminalSession = findTerminalSession();
 
-  const server = new Server(auth, terminalSessionId || undefined);
+  const server = new Server(auth, terminalSession || undefined);
   await server.start();
 }

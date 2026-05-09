@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -12,8 +12,14 @@ interface ClaudeOutput {
   is_error: boolean;
 }
 
-/** Find the session ID of the currently running Claude Code terminal session */
-export function findTerminalSessionId(): string | null {
+export interface TerminalSession {
+  sessionId: string;
+  cwd: string;
+  pid: number;
+}
+
+/** Find the session ID and working directory of the currently running Claude Code terminal session */
+export function findTerminalSession(): TerminalSession | null {
   const sessionsDir = path.join(os.homedir(), ".claude", "sessions");
   try {
     const files = fs.readdirSync(sessionsDir).filter(f => f.endsWith(".json"));
@@ -27,11 +33,11 @@ export function findTerminalSessionId(): string | null {
     for (const file of sorted) {
       try {
         const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file.name), "utf-8"));
-        if (data.sessionId && data.kind === "interactive") {
+        if (data.sessionId && data.cwd && data.kind === "interactive") {
           try {
             process.kill(data.pid, 0);
-            logger.info(`Found terminal session: ${data.sessionId} (pid=${data.pid})`);
-            return data.sessionId;
+            logger.info(`Found terminal session: ${data.sessionId} (pid=${data.pid}, cwd=${data.cwd})`);
+            return { sessionId: data.sessionId, cwd: data.cwd, pid: data.pid };
           } catch {
             // Process not alive, skip
           }
@@ -42,13 +48,13 @@ export function findTerminalSessionId(): string | null {
   return null;
 }
 
-export async function askClaude(message: string, sessionID?: string): Promise<{ text: string; sessionID: string }> {
+export async function askClaude(message: string, sessionID?: string, cwd?: string): Promise<{ text: string; sessionID: string }> {
   const args = ["--dangerously-skip-permissions", "--output-format", "json", "-p", message];
   if (sessionID) args.unshift("--resume", sessionID);
 
   logger.debug(`claude ${args.slice(0, 5).join(" ")}...`);
 
-  const result = await spawnClaude(args);
+  const result = await spawnClaude(args, cwd);
 
   try {
     const out: ClaudeOutput = JSON.parse(result);
@@ -62,21 +68,33 @@ export async function askClaude(message: string, sessionID?: string): Promise<{ 
   }
 }
 
-function spawnClaude(args: string[]): Promise<string> {
+function spawnClaude(args: string[], cwd?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = execFile(claudeBin, args, {
+    const proc = spawn(claudeBin, args, {
       timeout: 5 * 60_000,
-      maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env },
       shell: true,
-    }, (err, stdout, stderr) => {
-      if (err && !stdout) {
-        reject(new Error(`claude failed: ${err.message}\n${stderr?.slice(0, 300)}`));
+      stdio: ["ignore", "pipe", "pipe"],
+      cwd: cwd || process.cwd(),
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+    proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+    proc.on("error", (err) => {
+      reject(new Error(`claude failed: ${err.message}\n${stderr.slice(0, 300)}`));
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0 && !stdout) {
+        reject(new Error(`claude exited with code ${code}\n${stderr.slice(0, 300)}`));
         return;
       }
       if (stderr) logger.debug(`[claude stderr] ${stderr.slice(0, 200)}`);
-      resolve(stdout || "");
+      resolve(stdout);
     });
-    proc.stdin?.end();
   });
 }

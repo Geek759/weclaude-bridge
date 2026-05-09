@@ -1,0 +1,28 @@
+{
+  "name": "weclaude-bridge",
+  "version": "1.0.0",
+  "description": "WeChat to Claude Code bridge",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "weclaude": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "login": "node dist/index.js login",
+    "status": "node dist/index.js status",
+    "reset": "node dist/index.js reset",
+    "logout": "node dist/index.js logout"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.7.0"
+  }
+}

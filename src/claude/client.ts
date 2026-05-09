@@ -11,7 +11,13 @@ function resolveClaudeBin(): string {
   if (process.platform !== "win32" || path.isAbsolute(bin)) return bin;
   try {
     const resolved = execFileSync("where", [bin], { encoding: "utf-8", timeout: 5000 }).trim().split(/\r?\n/)[0];
-    if (resolved && fs.existsSync(resolved)) return resolved;
+    if (resolved) {
+      if (!path.extname(resolved)) {
+        const cmdPath = resolved + ".cmd";
+        if (fs.existsSync(cmdPath)) return cmdPath;
+      }
+      if (fs.existsSync(resolved)) return resolved;
+    }
   } catch {}
   return bin;
 }
@@ -56,7 +62,6 @@ export function findTerminalSession(): TerminalSession | null {
 }
 
 export async function askClaude(message: string, sessionID?: string, cwd?: string): Promise<{ text: string; sessionID: string }> {
-  // Pass message via stdin to avoid Windows shell encoding issues with Chinese characters
   const args = ["--dangerously-skip-permissions", "--output-format", "json", "-p"];
   if (sessionID) args.unshift("--resume", sessionID);
 
@@ -80,14 +85,14 @@ function spawnClaude(args: string[], cwd?: string, message?: string): Promise<st
   return new Promise((resolve, reject) => {
     const isWin = process.platform === "win32";
     const spawnBin = isWin ? (process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe") : claudeBin;
-    const spawnArgs = isWin ? ["/d", "/s", "/c", `"${claudeBin}" ${args.map(a => `"${a}"`).join(" ")}`] : args;
+    const cmdStr = `${claudeBin} ${args.map(a => `"${a}"`).join(" ")}`;
+    const spawnArgs = isWin ? ["/d", "/s", "/c", cmdStr] : args;
     const proc = spawn(spawnBin, spawnArgs, {
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
       ...(cwd ? { cwd } : {}),
     });
 
-    // Write message to stdin then close, so claude reads from stdin instead of argument
     if (message) {
       proc.stdin.write(message);
     }

@@ -1,10 +1,20 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { logger } from "../util/logger.js";
 
-const claudeBin = process.env.CLAUDE_BIN || "claude";
+const claudeBin = resolveClaudeBin();
+
+function resolveClaudeBin(): string {
+  const bin = process.env.CLAUDE_BIN || "claude";
+  if (process.platform !== "win32" || path.isAbsolute(bin)) return bin;
+  try {
+    const resolved = execFileSync("where", [bin], { encoding: "utf-8", timeout: 5000 }).trim().split(/\r?\n/)[0];
+    if (resolved && fs.existsSync(resolved)) return resolved;
+  } catch {}
+  return bin;
+}
 
 interface ClaudeOutput {
   result: string;
@@ -18,7 +28,6 @@ export interface TerminalSession {
   pid: number;
 }
 
-/** Find the session ID and working directory of the currently running Claude Code terminal session */
 export function findTerminalSession(): TerminalSession | null {
   const sessionsDir = path.join(os.homedir(), ".claude", "sessions");
   try {
@@ -38,9 +47,7 @@ export function findTerminalSession(): TerminalSession | null {
             process.kill(data.pid, 0);
             logger.info(`Found terminal session: ${data.sessionId} (pid=${data.pid}, cwd=${data.cwd})`);
             return { sessionId: data.sessionId, cwd: data.cwd, pid: data.pid };
-          } catch {
-            // Process not alive, skip
-          }
+          } catch {}
         }
       } catch {}
     }
@@ -49,12 +56,13 @@ export function findTerminalSession(): TerminalSession | null {
 }
 
 export async function askClaude(message: string, sessionID?: string, cwd?: string): Promise<{ text: string; sessionID: string }> {
-  const args = ["--dangerously-skip-permissions", "--output-format", "json", "-p", message];
+  // Pass message via stdin to avoid Windows shell encoding issues with Chinese characters
+  const args = ["--dangerously-skip-permissions", "--output-format", "json", "-p"];
   if (sessionID) args.unshift("--resume", sessionID);
 
-  logger.debug(`claude ${args.slice(0, 5).join(" ")}...`);
+  logger.debug(`claude ${args.join(" ")} [message via stdin]`);
 
-  const result = await spawnClaude(args, cwd);
+  const result = await spawnClaude(args, cwd, message);
 
   try {
     const out: ClaudeOutput = JSON.parse(result);
@@ -68,14 +76,22 @@ export async function askClaude(message: string, sessionID?: string, cwd?: strin
   }
 }
 
-function spawnClaude(args: string[], cwd?: string): Promise<string> {
+function spawnClaude(args: string[], cwd?: string, message?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(claudeBin, args, {
+    const isWin = process.platform === "win32";
+    const spawnBin = isWin ? (process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe") : claudeBin;
+    const spawnArgs = isWin ? ["/d", "/s", "/c", `"${claudeBin}" ${args.map(a => `"${a}"`).join(" ")}`] : args;
+    const proc = spawn(spawnBin, spawnArgs, {
       env: { ...process.env },
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd: cwd || process.cwd(),
+      stdio: ["pipe", "pipe", "pipe"],
+      ...(cwd ? { cwd } : {}),
     });
+
+    // Write message to stdin then close, so claude reads from stdin instead of argument
+    if (message) {
+      proc.stdin.write(message);
+    }
+    proc.stdin.end();
 
     let stdout = "";
     let stderr = "";
@@ -87,7 +103,6 @@ function spawnClaude(args: string[], cwd?: string): Promise<string> {
       reject(new Error(`claude failed: ${err.message}\n${stderr.slice(0, 300)}`));
     });
 
-    // 5 minute timeout
     const timer = setTimeout(() => {
       proc.kill("SIGTERM");
       reject(new Error("claude timeout (5 min)"));
